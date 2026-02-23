@@ -1,7 +1,8 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "agent": "./src/react_agent/graph.py:graph"
+    "default": "./src/react_agent/graph.py:graph",
+    "stock_portfolio": "./src/stoke_multi_agent/graph.py:graph"
   },
   "env": ".env"
 }

@@ -63,5 +63,11 @@ def load_chat_model(
 
         return create_siliconflow_model(model)
 
+    # Handle ByteDance Doubao models
+    if provider_lower == "doubao":
+        from .models import create_doubao_model
+
+        return create_doubao_model(model)
+
     # Use standard langchain initialization for other providers
     return init_chat_model(model, model_provider=provider)

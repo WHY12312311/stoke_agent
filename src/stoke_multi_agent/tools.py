@@ -12,15 +12,64 @@ import logging
 from typing import Any, Optional
 
 import akshare as ak  # type: ignore
+from langchain_core.tools import tool
+from stoke_multi_agent.portfolio import (
+    apply_trade,
+    async_load_portfolio,
+    async_save_portfolio,
+    get_portfolio_summary,
+    load_portfolio,
+    Portfolio,
+)
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Global concurrency limiter & retry helper for akshare calls.
+# akshare uses synchronous HTTP (requests) under the hood; we push each call
+# to a thread via asyncio.to_thread().  The semaphore prevents overwhelming
+# the upstream data source with too many simultaneous connections.
+# ---------------------------------------------------------------------------
+_AK_SEMAPHORE = asyncio.Semaphore(5)  # max 5 concurrent akshare requests
+_AK_MAX_RETRIES = 3
+_AK_RETRY_BASE_DELAY = 1.0  # seconds, exponential backoff
+
+
+async def _ak_call(func, *args, **kwargs):
+    """Run a blocking akshare function in a thread with concurrency limiting and retry.
+
+    - Acquires a semaphore slot to cap concurrent requests.
+    - Retries up to _AK_MAX_RETRIES times on connection errors with exponential backoff.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _AK_MAX_RETRIES + 1):
+        async with _AK_SEMAPHORE:
+            try:
+                return await asyncio.to_thread(func, *args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                # Only retry on connection-level errors
+                exc_msg = str(exc).lower()
+                retriable = any(kw in exc_msg for kw in (
+                    "remotedisconnected", "connection aborted", "connectionreset",
+                    "connectionrefused", "timeout", "timed out", "blocking",
+                ))
+                if not retriable or attempt == _AK_MAX_RETRIES:
+                    raise
+                delay = _AK_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    f"[akshare] {func.__name__} attempt {attempt}/{_AK_MAX_RETRIES} failed: {exc}, "
+                    f"retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+    # Should not reach here, but just in case
+    raise last_exc  # type: ignore[misc]
 
 # ---------------------------------------------------------------------------
 # Market Data Tools
 # ---------------------------------------------------------------------------
 
-async def get_stock_price(symbol: str) -> dict[str, Any]:
+async def _get_stock_price(symbol: str) -> dict[str, Any]:
     """获取指定 A 股股票代码的最新行情数据。
 
     Args:
@@ -36,7 +85,7 @@ async def get_stock_price(symbol: str) -> dict[str, Any]:
         end_date = date.today().strftime("%Y%m%d")
         start_date = (date.today() - timedelta(days=7)).strftime("%Y%m%d")
 
-        df = await asyncio.to_thread(
+        df = await _ak_call(
             ak.stock_zh_a_hist,
             symbol=symbol,
             period="daily",
@@ -76,6 +125,14 @@ async def get_stock_price(symbol: str) -> dict[str, Any]:
         return _mock_market_data(symbol)
 
 
+@tool
+async def get_stock_price(symbol: str) -> dict[str, Any]:
+    """获取指定 A 股股票代码的最新行情数据，包含价格、涨跌幅、成交量等。
+    symbol 必须是6位数字的 A 股代码，例如 '600519'（贵州茅台）。
+    """
+    return await _get_stock_price(symbol)
+
+
 # period 到 akshare 天数的映射
 _PERIOD_TO_DAYS: dict[str, int] = {
     "1mo": 30,
@@ -86,7 +143,7 @@ _PERIOD_TO_DAYS: dict[str, int] = {
 }
 
 
-async def get_stock_history(symbol: str, period: str = "1mo") -> dict[str, Any]:
+async def _get_stock_history(symbol: str, period: str = "1mo") -> dict[str, Any]:
     """获取 A 股历史 OHLCV 数据，用于技术指标计算。
 
     Args:
@@ -104,7 +161,7 @@ async def get_stock_history(symbol: str, period: str = "1mo") -> dict[str, Any]:
         start_date = (date.today() - timedelta(days=days)).strftime("%Y%m%d")
 
         # adjust="qfq" 表示前复权，适合技术分析
-        df = await asyncio.to_thread(
+        df = await _ak_call(
             ak.stock_zh_a_hist,
             symbol=symbol,
             period="daily",
@@ -127,6 +184,15 @@ async def get_stock_history(symbol: str, period: str = "1mo") -> dict[str, Any]:
     except Exception as e:
         logger.warning(f"akshare history fetch failed for {symbol}: {e}, using mock data")
         return _mock_history_data(symbol)
+
+
+@tool
+async def get_stock_history(symbol: str, period: str = "1mo") -> dict[str, Any]:
+    """获取 A 股历史数据并计算技术指标（MA5/MA20、RSI14、MACD）。
+    symbol: 6位 A 股代码。
+    period: 时间周期，支持 '1mo'、'3mo'、'6mo'、'1y'、'2y'。
+    """
+    return await _get_stock_history(symbol, period)
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +253,7 @@ def compute_technical_indicators(history: dict[str, Any]) -> dict[str, Any]:
 # News Sentiment Tools
 # ---------------------------------------------------------------------------
 
-async def search_stock_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+async def _search_stock_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
     """搜索指定股票的最新新闻并计算情绪评分。
 
     Args:
@@ -232,6 +298,14 @@ async def search_stock_news(symbol: str, company_name: Optional[str] = None) -> 
         }
 
 
+@tool
+async def search_stock_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+    """搜索指定股票的最新新闻并计算情绪评分。
+    symbol: 股票代码。company_name: 可选的公司名称。
+    """
+    return await _search_stock_news(symbol, company_name)
+
+
 # ---------------------------------------------------------------------------
 # Stock Code Lookup Tools（股票代码查询）
 # ---------------------------------------------------------------------------
@@ -240,7 +314,7 @@ async def search_stock_news(symbol: str, company_name: Optional[str] = None) -> 
 _stock_code_cache: dict[str, str] | None = None
 
 
-async def search_stock_by_name(name_query: str) -> dict[str, Any]:
+async def _search_stock_by_name(name_query: str) -> dict[str, Any]:
     """通过公司名称或简称模糊搜索 A 股股票代码。
 
     优先使用 akshare 的全市场股票列表做本地模糊匹配，速度快且无需网络请求。
@@ -261,7 +335,7 @@ async def search_stock_by_name(name_query: str) -> dict[str, Any]:
     try:
         # 首次调用时拉取全市场股票列表并缓存
         if _stock_code_cache is None:
-            df = await asyncio.to_thread(ak.stock_info_a_code_name)
+            df = await _ak_call(ak.stock_info_a_code_name)
             # 列名：code（代码）、name（名称）
             _stock_code_cache = dict(zip(df["code"].astype(str), df["name"].astype(str)))
             logger.info(f"[StockLookup] Loaded {len(_stock_code_cache)} A-share stocks into cache")
@@ -295,11 +369,20 @@ async def search_stock_by_name(name_query: str) -> dict[str, Any]:
         }
 
 
+@tool
+async def search_stock_by_name(name_query: str) -> dict[str, Any]:
+    """通过公司名称或简称模糊搜索 A 股股票代码。
+    name_query: 用户输入的公司名称或简称，例如 '茅台'、'比亚迪'。
+    返回匹配的股票代码和名称列表。
+    """
+    return await _search_stock_by_name(name_query)
+
+
 # ---------------------------------------------------------------------------
 # Fundamental Analysis Tools（新增）
 # ---------------------------------------------------------------------------
 
-async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+async def _get_fundamental_data(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
     """获取 A 股基本面数据：财务指标、估值、行业信息。
 
     数据来源：
@@ -323,7 +406,7 @@ async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) 
 
         # --- 基本信息：总市值、行业 ---
         try:
-            info_df = await asyncio.to_thread(ak.stock_individual_info_em, symbol=symbol)
+            info_df = await _ak_call(ak.stock_individual_info_em, symbol=symbol)
             if not info_df.empty:
                 info_dict = dict(zip(info_df["item"], info_df["value"]))
                 result["company_name"] = str(info_dict.get("股票简称", company_name or symbol))
@@ -336,8 +419,8 @@ async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) 
         # --- 实时估值：PE / PB（百度财经，单只查询，避免拉取全市场数据）---
         try:
             pe_df, pb_df = await asyncio.gather(
-                asyncio.to_thread(ak.stock_zh_valuation_baidu, symbol=symbol, indicator="市盈率(TTM)"),
-                asyncio.to_thread(ak.stock_zh_valuation_baidu, symbol=symbol, indicator="市净率"),
+                _ak_call(ak.stock_zh_valuation_baidu, symbol=symbol, indicator="市盈率(TTM)"),
+                _ak_call(ak.stock_zh_valuation_baidu, symbol=symbol, indicator="市净率"),
             )
             if not pe_df.empty:
                 result["pe_ratio"] = _safe_float(pe_df.iloc[-1].get("value"))
@@ -348,7 +431,7 @@ async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) 
 
         # --- 财务摘要：ROE / 营收 / 净利润（同花顺）---
         try:
-            fin_df = await asyncio.to_thread(ak.stock_financial_abstract_ths, symbol=symbol, indicator="按年度")
+            fin_df = await _ak_call(ak.stock_financial_abstract_ths, symbol=symbol, indicator="按年度")
             if not fin_df.empty:
                 latest_fin = fin_df.iloc[0]  # 最新一期在第一行
                 result["roe"] = _safe_float(latest_fin.get("净资产收益率"))
@@ -366,7 +449,15 @@ async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) 
         return _mock_fundamental_data(symbol, company_name)
 
 
-async def search_financial_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+@tool
+async def get_fundamental_data(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+    """获取 A 股基本面数据：PE、PB、ROE、营收、净利润、行业信息等。
+    symbol: 6位 A 股代码。company_name: 可选的公司名称。
+    """
+    return await _get_fundamental_data(symbol, company_name)
+
+
+async def _search_financial_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
     """搜索股票相关的财经、舆论、政策新闻（比 search_stock_news 更广泛）。
 
     Args:
@@ -423,6 +514,14 @@ async def search_financial_news(symbol: str, company_name: Optional[str] = None)
             "total_found": 0,
             "error": str(e),
         }
+
+
+@tool
+async def search_financial_news(symbol: str, company_name: Optional[str] = None) -> dict[str, Any]:
+    """搜索股票相关的财经深度报道、政策动态、行业舆论（比 search_stock_news 更广泛）。
+    symbol: 6位 A 股代码。company_name: 可选的公司名称。
+    """
+    return await _search_financial_news(symbol, company_name)
 
 
 # ---------------------------------------------------------------------------
@@ -567,3 +666,37 @@ def _mock_history_data(symbol: str) -> dict[str, Any]:
         "volumes": [random.randint(1_000_000, 10_000_000) for _ in closes],
         "dates": [f"2025-{(i // 30) + 1:02d}-{(i % 30) + 1:02d}" for i in range(60)],
     }
+
+
+
+@tool
+def get_portfolio_info_tool() -> dict:
+    """获取当前用户的持仓信息摘要，包含各股票的持仓数量、成本价、账户现金余额等。无需任何参数。"""
+    portfolio = load_portfolio()
+    summary = get_portfolio_summary(portfolio)
+    total_cost = sum(pos.total_cost for pos in portfolio.positions.values())
+    return {
+        "summary": summary,
+        "positions": {
+            symbol: {
+                "company_name": pos.company_name,
+                "shares": pos.shares,
+                "avg_cost": pos.avg_cost,
+                "total_cost": pos.total_cost,
+            }
+            for symbol, pos in portfolio.positions.items()
+        },
+        "total_positions": len(portfolio.positions),
+        "cash_balance": portfolio.cash_balance,
+        "total_assets": round(total_cost + portfolio.cash_balance, 2),
+    }
+
+STOKE_BASE_TOOLS = [
+    get_stock_price,
+    get_stock_history,
+    search_stock_news,
+    get_fundamental_data,
+    search_financial_news,
+    search_stock_by_name,
+    get_portfolio_info_tool,
+]

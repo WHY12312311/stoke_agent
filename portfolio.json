@@ -11,18 +11,18 @@
     "601318": {
       "symbol": "601318",
       "company_name": "中国平安",
-      "shares": 100.0,
+      "shares": 50.0,
       "avg_cost": 110.46,
-      "total_cost": 11046.0,
-      "last_updated": "2026-02-23T18:53:01.068143"
+      "total_cost": 5523.0,
+      "last_updated": "2026-02-24T20:19:56.889509"
     },
     "600036": {
       "symbol": "600036",
       "company_name": "招商银行",
-      "shares": 300.0,
-      "avg_cost": 406.76,
-      "total_cost": 122028.0,
-      "last_updated": "2026-02-23T18:53:01.219718"
+      "shares": 800.0,
+      "avg_cost": 389.73,
+      "total_cost": 311784.0,
+      "last_updated": "2026-02-24T20:26:43.833795"
     }
   },
   "trade_history": [
@@ -52,6 +52,48 @@
       "shares": 300.0,
       "price": 406.76,
       "amount": 122028.0
+    },
+    {
+      "time": "2026-02-24T20:19:56.577955",
+      "symbol": "600036",
+      "company_name": "招商银行",
+      "action": "sell",
+      "shares": 300.0,
+      "price": 272.62,
+      "amount": 81786.0
+    },
+    {
+      "time": "2026-02-24T20:19:56.889509",
+      "symbol": "601318",
+      "company_name": "中国平安",
+      "action": "sell",
+      "shares": 50.0,
+      "price": 78.57,
+      "amount": 3928.5
+    },
+    {
+      "time": "2026-02-24T20:26:38.437238",
+      "symbol": "600495",
+      "company_name": "晋西车轴",
+      "action": "sell",
+      "shares": 500.0,
+      "price": 180.71,
+      "amount": 90355.0
+    },
+    {
+      "time": "2026-02-24T20:26:43.833795",
+      "symbol": "600036",
+      "company_name": "招商银行",
+      "action": "buy",
+      "shares": 800.0,
+      "price": 389.73,
+      "amount": 311784.0
+    },
+    {
+      "time": "2026-02-24T20:27:34.348374",
+      "action": "deposit",
+      "amount": 226069.5
     }
-  ]
+  ],
+  "cash_balance": 0.0
 }

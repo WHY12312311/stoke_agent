@@ -56,10 +56,14 @@ class Portfolio:
     trade_history: list[dict] = field(default_factory=list)
     """交易历史记录。"""
 
+    cash_balance: float = 0.0
+    """账户现金余额（元）。买入扣减、卖出回收、可直接入金/出金。"""
+
     def to_dict(self) -> dict:
         return {
             "positions": {k: asdict(v) for k, v in self.positions.items()},
             "trade_history": self.trade_history,
+            "cash_balance": self.cash_balance,
         }
 
     @classmethod
@@ -68,6 +72,7 @@ class Portfolio:
         for symbol, pos_data in data.get("positions", {}).items():
             portfolio.positions[symbol] = Position(**pos_data)
         portfolio.trade_history = data.get("trade_history", [])
+        portfolio.cash_balance = float(data.get("cash_balance", 0.0))
         return portfolio
 
 
@@ -177,12 +182,22 @@ def apply_trade(
     }
     portfolio.trade_history.append(trade_record)
 
+    trade_amount = round(shares * price, 2)
+
     if action == "buy":
+        # Check if there is enough cash (allow buying even without sufficient cash, but warn)
+        cash_warning = ""
+        if portfolio.cash_balance < trade_amount:
+            shortfall = trade_amount - portfolio.cash_balance
+            cash_warning = f"\n⚠️ 账户现金不足（缺口 {shortfall:.2f} 元），已透支处理。建议后续入金补足。"
+
+        portfolio.cash_balance = round(portfolio.cash_balance - trade_amount, 2)
+
         if symbol in portfolio.positions:
             pos = portfolio.positions[symbol]
-            # 加权平均成本
+            # Weighted average cost
             total_shares = pos.shares + shares
-            total_cost = pos.total_cost + shares * price
+            total_cost = pos.total_cost + trade_amount
             pos.shares = total_shares
             pos.avg_cost = round(total_cost / total_shares, 4)
             pos.total_cost = round(total_cost, 2)
@@ -195,10 +210,14 @@ def apply_trade(
                 company_name=company_name,
                 shares=shares,
                 avg_cost=round(price, 4),
-                total_cost=round(shares * price, 2),
+                total_cost=trade_amount,
                 last_updated=now,
             )
-        result = f"✅ 买入 {company_name or symbol} {shares:.0f} 股，成交价 {price:.2f} 元，总金额 {shares * price:.2f} 元"
+        result = (
+            f"✅ 买入 {company_name or symbol} {shares:.0f} 股，"
+            f"成交价 {price:.2f} 元，总金额 {trade_amount:.2f} 元"
+            f"{cash_warning}"
+        )
 
     elif action == "sell":
         if symbol not in portfolio.positions or portfolio.positions[symbol].shares <= 0:
@@ -208,28 +227,85 @@ def apply_trade(
         if shares > pos.shares:
             return f"❌ 卖出失败：持仓不足，当前持有 {pos.shares:.0f} 股，尝试卖出 {shares:.0f} 股"
 
+        # Sell proceeds go back to cash balance
+        portfolio.cash_balance = round(portfolio.cash_balance + trade_amount, 2)
+
         pos.shares -= shares
         pos.total_cost = round(pos.avg_cost * pos.shares, 2)
         pos.last_updated = now
 
-        # 持仓清零则删除
+        # Remove position if fully sold
         if pos.shares <= 0:
             del portfolio.positions[symbol]
-            result = f"✅ 卖出 {company_name or symbol} {shares:.0f} 股，成交价 {price:.2f} 元，已清仓"
+            result = f"✅ 卖出 {company_name or symbol} {shares:.0f} 股，成交价 {price:.2f} 元，回收 {trade_amount:.2f} 元，已清仓"
         else:
-            result = f"✅ 卖出 {company_name or symbol} {shares:.0f} 股，成交价 {price:.2f} 元，剩余 {pos.shares:.0f} 股"
+            result = f"✅ 卖出 {company_name or symbol} {shares:.0f} 股，成交价 {price:.2f} 元，回收 {trade_amount:.2f} 元，剩余 {pos.shares:.0f} 股"
     else:
         result = f"❌ 未知操作类型：{action}"
 
     return result
 
 
+def deposit_cash(portfolio: Portfolio, amount: float) -> str:
+    """向账户入金。
+
+    Args:
+        portfolio: 当前持仓对象（会被原地修改）。
+        amount: 入金金额（元），必须大于 0。
+
+    Returns:
+        操作结果描述。
+    """
+    if amount <= 0:
+        return f"❌ 入金金额必须大于 0，收到 {amount:.2f} 元"
+
+    portfolio.cash_balance = round(portfolio.cash_balance + amount, 2)
+    portfolio.trade_history.append({
+        "time": datetime.now().isoformat(),
+        "action": "deposit",
+        "amount": amount,
+    })
+    return f"✅ 入金 {amount:,.2f} 元，当前账户现金余额：{portfolio.cash_balance:,.2f} 元"
+
+
+def withdraw_cash(portfolio: Portfolio, amount: float) -> str:
+    """从账户出金。
+
+    Args:
+        portfolio: 当前持仓对象（会被原地修改）。
+        amount: 出金金额（元），必须大于 0 且不超过现金余额。
+
+    Returns:
+        操作结果描述。
+    """
+    if amount <= 0:
+        return f"❌ 出金金额必须大于 0，收到 {amount:.2f} 元"
+    if amount > portfolio.cash_balance:
+        return f"❌ 出金失败：当前现金余额 {portfolio.cash_balance:,.2f} 元，不足以出金 {amount:,.2f} 元"
+
+    portfolio.cash_balance = round(portfolio.cash_balance - amount, 2)
+    portfolio.trade_history.append({
+        "time": datetime.now().isoformat(),
+        "action": "withdraw",
+        "amount": amount,
+    })
+    return f"✅ 出金 {amount:,.2f} 元，当前账户现金余额：{portfolio.cash_balance:,.2f} 元"
+
+
 def get_portfolio_summary(portfolio: Portfolio) -> str:
     """生成持仓摘要文本，供 LLM 分析使用。"""
-    if not portfolio.positions:
-        return "当前无持仓。"
+    lines = []
 
-    lines = ["📋 当前持仓明细：\n"]
+    # Cash balance section (always shown)
+    lines.append(f"💵 账户现金余额：{portfolio.cash_balance:,.2f} 元\n")
+
+    if not portfolio.positions:
+        lines.append("📋 当前无股票持仓。")
+        total_assets = portfolio.cash_balance
+        lines.append(f"\n💰 账户总资产（现金）：{total_assets:,.2f} 元")
+        return "\n".join(lines)
+
+    lines.append("📋 当前持仓明细：\n")
     total_cost = 0.0
     for symbol, pos in portfolio.positions.items():
         lines.append(
@@ -240,6 +316,8 @@ def get_portfolio_summary(portfolio: Portfolio) -> str:
         )
         total_cost += pos.total_cost
 
-    lines.append(f"\n💰 总持仓成本：{total_cost:.2f} 元")
+    lines.append(f"\n💰 总持仓成本：{total_cost:,.2f} 元")
+    lines.append(f"💵 账户现金余额：{portfolio.cash_balance:,.2f} 元")
+    lines.append(f"💰 账户总资产（持仓成本+现金）：{total_cost + portfolio.cash_balance:,.2f} 元")
     lines.append(f"📊 持仓股票数：{len(portfolio.positions)} 只")
     return "\n".join(lines)

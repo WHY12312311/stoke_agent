@@ -104,3 +104,8 @@ class StockAnalysisState(InputState):
 
     recommend_result: Optional[str] = field(default=None)
     """选股推荐 Agent 的输出：推荐的 5 支股票及买入数量、推荐理由。"""
+
+    # ---- 问答分析相关 ----
+
+    qa_result: Optional[str] = field(default=None)
+    """QA Agent（ReAct 架构）的输出：针对用户问题的分析解答。"""

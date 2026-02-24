@@ -22,19 +22,26 @@ from stoke_multi_agent.portfolio import (
     apply_trade,
     async_load_portfolio,
     async_save_portfolio,
+    deposit_cash,
     get_portfolio_summary,
     load_portfolio,
     Portfolio,
+    withdraw_cash,
 )
 from stoke_multi_agent.state import StockAnalysisState
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+
 from stoke_multi_agent.tools import (
+    STOKE_BASE_TOOLS,
+    _ak_call,
+    _get_fundamental_data,
+    _get_stock_history,
+    _get_stock_price,
+    _search_financial_news,
+    _search_stock_by_name,
+    _search_stock_news,
     compute_technical_indicators,
-    get_fundamental_data,
-    get_stock_history,
-    get_stock_price,
-    search_financial_news,
-    search_stock_news,
-    search_stock_by_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,22 +81,45 @@ async def trade_recorder_node(
     # Step 1：LLM 只负责提取「交易意图」和「公司名称/关键词」
     # 不让 LLM 猜股票代码，避免幻觉导致买错股票
     # ---------------------------------------------------------------
-    parse_prompt = f"""请从用户的口语化描述中提取所有股票交易信息，返回 JSON 数组格式。
+    # Load portfolio upfront so LLM can see current holdings for smart sell
+    portfolio = await async_load_portfolio()
+    portfolio_info = get_portfolio_summary(portfolio)
+
+    # Build position details for the LLM (so it knows exact share counts)
+    positions_detail = ""
+    if portfolio.positions:
+        pos_lines = []
+        for sym, pos in portfolio.positions.items():
+            pos_lines.append(f"  - {pos.company_name}（{sym}）：持有 {pos.shares:.0f} 股，均价 {pos.avg_cost:.2f} 元")
+        positions_detail = "\n".join(pos_lines)
+    else:
+        positions_detail = "  当前无持仓"
+
+    parse_prompt = f"""请从用户的口语化描述中提取所有操作信息，返回 JSON 数组格式。
 
 用户描述：{user_message}
 
-请返回如下 JSON 数组（每笔交易一个对象，如果某字段无法确定，填 null）：
+当前账户信息：
+- 现金余额：{portfolio.cash_balance:.2f} 元
+- 持仓明细：
+{positions_detail}
+
+请返回如下 JSON 数组（每个操作一个对象，如果某字段无法确定，填 null）：
 [
   {{
-    "action": "buy" 或 "sell",
-    "company_query": "用户提到的公司名称或简称（原文，不要翻译或补全，例如：'茅台'、'比亚迪'、'宁德时代'）",
-    "shares": 股数（数字，A股1手=100股，如说'1手'则填100，如说'半手'则填50），
-    "price": 成交价格（元/股，如果用户没说价格填 null）
+    "action": "buy" 或 "sell" 或 "deposit"（入金） 或 "withdraw"（出金）,
+    "company_query": "用户提到的公司名称或简称（买卖时必填，入金/出金时填 null）",
+    "shares": 股数（数字，A股1手=100股，入金/出金时填 null）,
+    "price": 成交价格（元/股，如果用户没说价格填 null，入金/出金时填 null）,
+    "amount": 金额（仅 deposit/withdraw 时填写，单位：元）
   }}
 ]
 
-注意：
-- 如果用户提到多笔交易，每笔交易单独一个对象
+重要规则：
+- 如果用户说"全部卖出"、"清仓"、"都卖了"某只股票，shares 必须填该股票的实际持仓股数（参考上面的持仓明细）
+- 如果用户说"卖一半"，shares 填持仓股数的一半（取整到100的整数倍）
+- 如果用户说"入金5万"、"充值3万"、"转入1万"，action 填 "deposit"，amount 填对应金额（如5万=50000）
+- 如果用户说"出金1万"、"提现"、"取出"，action 填 "withdraw"，amount 填对应金额
 - company_query 只填用户原文中的公司名称，**不要填股票代码**
 - 如果用户说"1手"，shares = 100
 - 只返回 JSON 数组，不要有其他内容
@@ -121,13 +151,28 @@ async def trade_recorder_node(
         }
 
     # ---------------------------------------------------------------
-    # Step 2 & 3：逐笔处理每条交易
+    # Step 2 & 3：逐笔处理每条操作
     # ---------------------------------------------------------------
-    portfolio = await async_load_portfolio()
     result_messages = []
 
     for trade_info in trade_list:
         action = trade_info.get("action")
+
+        # --- Handle deposit / withdraw ---
+        if action == "deposit":
+            amount = float(trade_info.get("amount") or 0)
+            result_msg = deposit_cash(portfolio, amount)
+            logger.info(f"[TradeRecorder] Deposit: {result_msg}")
+            result_messages.append(result_msg)
+            continue
+        elif action == "withdraw":
+            amount = float(trade_info.get("amount") or 0)
+            result_msg = withdraw_cash(portfolio, amount)
+            logger.info(f"[TradeRecorder] Withdraw: {result_msg}")
+            result_messages.append(result_msg)
+            continue
+
+        # --- Handle buy / sell ---
         company_query = (trade_info.get("company_query") or "").strip()
         shares = trade_info.get("shares")
         price = trade_info.get("price")
@@ -138,7 +183,7 @@ async def trade_recorder_node(
 
         # Step 2：通过工具查询真实股票代码（不依赖 LLM 猜测）
         logger.info(f"[TradeRecorder] Looking up stock code for: '{company_query}'")
-        lookup_result = await search_stock_by_name(company_query)
+        lookup_result = await _search_stock_by_name(company_query)
         matches = lookup_result.get("matches", [])
 
         if not matches:
@@ -170,7 +215,7 @@ async def trade_recorder_node(
         # Step 3：如果没有价格，用当前市价
         if not price:
             logger.info(f"[TradeRecorder] No price provided, fetching current price for {symbol}")
-            market_data = await get_stock_price(symbol)
+            market_data = await _get_stock_price(symbol)
             price = market_data.get("price", 0)
             if price == 0:
                 result_messages.append(f"❌ 无法获取 {company_name}（{symbol}）的当前价格，请手动提供成交价格")
@@ -233,7 +278,7 @@ async def market_monitor_node(
 
     # 并发获取所有持仓股票的行情
     import asyncio
-    tasks = [get_stock_price(symbol) for symbol in symbols]
+    tasks = [_get_stock_price(symbol) for symbol in symbols]
     market_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 整理行情数据
@@ -298,7 +343,7 @@ async def technical_analysis_node(
 
     # 并发获取历史数据并计算指标
     import asyncio
-    history_tasks = [get_stock_history(symbol, period="3mo") for symbol in symbols]
+    history_tasks = [_get_stock_history(symbol, period="3mo") for symbol in symbols]
     histories = await asyncio.gather(*history_tasks, return_exceptions=True)
 
     indicators_list = []
@@ -370,7 +415,7 @@ async def news_sentiment_node(
     for symbol in symbols:
         pos = portfolio.positions.get(symbol)
         company_name = pos.company_name if pos else None
-        news_tasks.append(search_stock_news(symbol, company_name=company_name))
+        news_tasks.append(_search_stock_news(symbol, company_name=company_name))
 
     news_results = await asyncio.gather(*news_tasks, return_exceptions=True)
 
@@ -458,8 +503,8 @@ async def fundamental_analysis_node(
     for symbol in symbols:
         pos = portfolio.positions.get(symbol)
         company_name = pos.company_name if pos else None
-        fundamental_tasks.append(get_fundamental_data(symbol, company_name))
-        financial_news_tasks.append(search_financial_news(symbol, company_name))
+        fundamental_tasks.append(_get_fundamental_data(symbol, company_name))
+        financial_news_tasks.append(_search_financial_news(symbol, company_name))
 
     fundamental_results = await asyncio.gather(*fundamental_tasks, return_exceptions=True)
     financial_news_results = await asyncio.gather(*financial_news_tasks, return_exceptions=True)
@@ -559,7 +604,7 @@ async def stock_recommender_node(
     try:
         import akshare as ak  # type: ignore
 
-        df = ak.stock_zh_a_spot_em()
+        df = await _ak_call(ak.stock_zh_a_spot_em)
         # 过滤条件：
         # - 价格在预算的 1/50 以内（单手 100 股能买得起）
         # - 成交额 > 5 亿（流动性充足）
@@ -603,11 +648,11 @@ async def stock_recommender_node(
     top_info = candidate_info[:15]
 
     fundamental_tasks = [
-        get_fundamental_data(sym, next((c["name"] for c in top_info if c["symbol"] == sym), None))
+        _get_fundamental_data(sym, next((c["name"] for c in top_info if c["symbol"] == sym), None))
         for sym in top_candidates
     ]
     news_tasks = [
-        search_stock_news(sym, next((c["name"] for c in top_info if c["symbol"] == sym), None))
+        _search_stock_news(sym, next((c["name"] for c in top_info if c["symbol"] == sym), None))
         for sym in top_candidates
     ]
 
@@ -694,4 +739,70 @@ async def stock_recommender_node(
     return {
         "recommend_result": recommendation,
         "messages": [AIMessage(content=recommendation)],
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Sub-Agent 6: QA Agent（问答分析节点 - ReAct 架构，同时处理追问）
+# ---------------------------------------------------------------------------
+
+async def qa_agent_node(
+    state: StockAnalysisState, runtime: Runtime[Context]
+) -> Dict[str, Any]:
+    """问答分析节点（ReAct 架构）：按需调用工具回答用户问题，同时兼容追问场景。
+
+    使用 LangGraph 内置的 create_react_agent，无需手写 ReAct 循环：
+    - 有工具需求时：LLM 自动推理 -> 调用工具 -> 观察结果 -> 继续推理或给出答案
+    - 无工具需求时（如追问）：LLM 直接基于对话历史回答，不触发任何工具调用
+
+    Args:
+        state: 当前状态，包含完整对话历史。
+        runtime: LangGraph 运行时。
+
+    Returns:
+        更新 qa_result 和 messages 字段的状态 patch。
+    """
+    logger.info("[QAAgent] Starting ReAct QA agent")
+
+    model = load_chat_model(runtime.context.model)
+
+    qa_system_prompt = (
+        "你是一位专业的 A 股投资顾问，擅长股票分析、行情解读和投资建议。\n"
+        "可用工具：\n"
+        "- get_stock_price：获取股票实时行情\n"
+        "- get_stock_history：获取历史数据和技术指标（MA、RSI、MACD）\n"
+        "- search_stock_news：搜索股票最新新闻和情绪评分\n"
+        "- get_fundamental_data：获取基本面数据（PE、PB、ROE等）\n"
+        "- search_financial_news：搜索财经深度报道和政策动态\n"
+        "- search_stock_by_name：通过公司名称查询股票代码\n"
+        "- get_portfolio_info_tool：获取用户当前持仓信息\n\n"
+        "工作原则：\n"
+        "1. 按需调用工具，不要调用不必要的工具；如果根据对话历史已有足够信息，直接回答即可\n"
+        "2. 用户提到公司名称但没有代码时，先用 search_stock_by_name 查询\n"
+        "3. 结合完整对话历史理解用户意图（包括追问场景）\n"
+        "4. 回答要专业、简洁，涉及投资建议时务必附上风险提示"
+    )
+
+    # create_react_agent 内置完整的 ReAct 循环（工具调用 + 结果观察 + 迭代）
+    agent = create_react_agent(
+        model=model,
+        tools=STOKE_BASE_TOOLS,
+        prompt=qa_system_prompt,
+    )
+
+    # 取最近 20 条历史消息传入，避免 token 超限
+    max_history = 20
+    history = state.messages[-max_history:] if len(state.messages) > max_history else state.messages
+
+    result = await agent.ainvoke({"messages": list(history)})
+
+    # create_react_agent 返回的 messages 列表中，最后一条是最终回答
+    final_msg = result["messages"][-1]
+    final_answer = final_msg.content if isinstance(final_msg.content, str) else str(final_msg.content)
+
+    logger.info(f"[QAAgent] QA completed, answer length: {len(final_answer)}")
+    return {
+        "qa_result": final_answer,
+        "messages": [AIMessage(content=final_answer)],
     }
